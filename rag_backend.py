@@ -170,20 +170,41 @@ class GoogleAILLM(LLM):
         try:
             # Get actual available models from Google AI
             print("[DEBUG] Calling client.models.list()...")
-            models = client.models.list()
-            print(f"[DEBUG] Raw models response: {models}")
+            models_pager = client.models.list()
+            print(f"[DEBUG] Raw models response: {models_pager}")
             
             available_model_names = []
-            for model in models:
-                print(f"[DEBUG] Processing model: {model}")
-                if hasattr(model, 'name'):
-                    available_model_names.append(model.name)
-                    print(f"[DEBUG] Added model name: {model.name}")
-                else:
-                    print(f"[DEBUG] Model has no 'name' attribute: {model}")
+            # Iterate through the pager to get actual models
+            try:
+                models_list = list(models_pager)  # Convert pager to list
+                print(f"[DEBUG] Models list length: {len(models_list)}")
+                
+                for model in models_list:
+                    print(f"[DEBUG] Processing model: {model}")
+                    if hasattr(model, 'name'):
+                        available_model_names.append(model.name)
+                        print(f"[DEBUG] Added model name: {model.name}")
+                    else:
+                        print(f"[DEBUG] Model has no 'name' attribute: {model}")
+                        
+            except Exception as pager_error:
+                print(f"[DEBUG] Error iterating pager: {pager_error}")
+                # Alternative: try to access the models directly
+                try:
+                    for model in models_pager:
+                        if hasattr(model, 'name'):
+                            available_model_names.append(model.name)
+                            print(f"[DEBUG] Added model name (alt method): {model.name}")
+                except Exception as iter_error:
+                    print(f"[DEBUG] Alternative iteration also failed: {iter_error}")
             
             print(f"[DEBUG] Google AI reports {len(available_model_names)} total models available")
             print(f"[DEBUG] Available model names: {available_model_names}")
+            
+            # If no models found via API listing, use our predefined list
+            if not available_model_names:
+                print("[DEBUG] No models found via API listing, using predefined list")
+                available_model_names = GOOGLE_AI_MODELS  # Use our predefined models
             
             # Filter out models that have exceeded quota and match our preferred list
             available_models = []
@@ -192,7 +213,12 @@ class GoogleAILLM(LLM):
                     available_models.append(model)
                     print(f"[DEBUG] Model {model}: Available")
                 elif model not in available_model_names:
-                    print(f"[DEBUG] Model {model}: Not found in Google AI list")
+                    # If API listing failed, assume model exists unless proven otherwise
+                    if not available_model_names or len(available_model_names) == len(GOOGLE_AI_MODELS):
+                        available_models.append(model)  
+                        print(f"[DEBUG] Model {model}: Assuming available (API listing incomplete)")
+                    else:
+                        print(f"[DEBUG] Model {model}: Not found in Google AI list")
                 elif model in quota_exceeded_models:
                     print(f"[DEBUG] Model {model}: Quota exceeded")
             
