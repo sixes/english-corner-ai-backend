@@ -134,7 +134,8 @@ GOOGLE_AI_MODELS = [
 ]
 
 # Track which models have hit quota limits (reset on startup)
-quota_exceeded_models = set()
+quota_exceeded_models = set()  # For LLM models
+quota_exceeded_embedding_models = set()  # For embedding models (separate tracking)
 
 # Groq free models (as backup when Google AI exhausted)
 GROQ_MODELS = [
@@ -146,8 +147,9 @@ GROQ_MODELS = [
 
 def reset_quota_tracking():
     """Reset quota tracking on startup or when needed"""
-    global quota_exceeded_models
+    global quota_exceeded_models, quota_exceeded_embedding_models
     quota_exceeded_models.clear()
+    quota_exceeded_embedding_models.clear()
     print("Quota tracking reset - all models marked as available")
 
 # Custom Google AI LLM for LangChain
@@ -163,29 +165,42 @@ class GoogleAILLM(LLM):
         if DEV_MODE:
             return GOOGLE_AI_MODELS
             
+        print(f"[DEBUG] Checking available models. quota_exceeded_models: {quota_exceeded_models}")
+        
         try:
             # Get actual available models from Google AI
             models = client.models.list()
             available_model_names = [model.name for model in models if hasattr(model, 'name')]
+            print(f"[DEBUG] Google AI reports {len(available_model_names)} total models available")
             
             # Filter out models that have exceeded quota and match our preferred list
             available_models = []
             for model in GOOGLE_AI_MODELS:
                 if model in available_model_names and model not in quota_exceeded_models:
                     available_models.append(model)
+                    print(f"[DEBUG] Model {model}: Available")
+                elif model not in available_model_names:
+                    print(f"[DEBUG] Model {model}: Not found in Google AI list")
+                elif model in quota_exceeded_models:
+                    print(f"[DEBUG] Model {model}: Quota exceeded")
             
             # If all preferred models are quota-exceeded, try other available models
             if not available_models:
+                print("[DEBUG] No preferred models available, checking other Gemini models...")
                 for model_name in available_model_names:
                     if model_name not in quota_exceeded_models and 'gemini' in model_name.lower():
                         available_models.append(model_name)
+                        print(f"[DEBUG] Found alternative model: {model_name}")
             
+            print(f"[DEBUG] Final available models: {available_models}")
             return available_models
             
         except Exception as e:
             print(f"Error getting available models: {e}")
             # Fallback to our predefined list
-            return [model for model in GOOGLE_AI_MODELS if model not in quota_exceeded_models]
+            fallback_models = [model for model in GOOGLE_AI_MODELS if model not in quota_exceeded_models]
+            print(f"[DEBUG] Using fallback models: {fallback_models}")
+            return fallback_models
 
     @property
     def _llm_type(self) -> str:
@@ -225,14 +240,18 @@ class GoogleAILLM(LLM):
         if DEV_MODE:
             return f"Mock response for development mode. Query: {prompt[:100]}..."
 
+        print(f"[DEBUG] Starting LLM call. Current quota_exceeded_models: {quota_exceeded_models}")
+
         # Get available models
         available_models = self._get_available_models()
+        print(f"[DEBUG] Available models after filtering: {available_models}")
         
         if not available_models:
             # Reset quota tracking if all models are exhausted (maybe quotas have reset)
             print("All models quota-exceeded, resetting quota tracking...")
             quota_exceeded_models.clear()
             available_models = self._get_available_models()
+            print(f"[DEBUG] Available models after reset: {available_models}")
         
         if not available_models:
             # Still no models available, return helpful error
@@ -245,12 +264,15 @@ class GoogleAILLM(LLM):
         # Try each available model in order
         last_error = None
         for model_name in available_models:
+            print(f"[DEBUG] Trying model: {model_name}")
             try:
                 result = self._call_with_model(prompt, model_name)
+                print(f"[DEBUG] Model {model_name} succeeded!")
                 return result
                 
             except Exception as e:
                 last_error = str(e)
+                print(f"[DEBUG] Model {model_name} failed: {last_error}")
                 if "QUOTA_EXCEEDED" in last_error:
                     print(f"Model {model_name} quota exceeded, trying next model...")
                     continue
@@ -262,6 +284,7 @@ class GoogleAILLM(LLM):
                     continue
 
         # If we get here, all models failed
+        print(f"[DEBUG] All models failed. Last error: {last_error}")
         return (
             f"I'm sorry, but I'm currently experiencing technical difficulties with Google AI services. "
             f"Please try again in a moment. Technical details: {last_error}"
@@ -376,10 +399,12 @@ class GoogleAIEmbeddings(Embeddings):
     def __init__(self, model_name: str = "text-embedding-004"):
         self.model_name = model_name
         self.embedding_models = ["text-embedding-004", "text-embedding-003"]  # Alternative embedding models
-        self.quota_exceeded_embedding_models = set()
+        # Use global embedding quota tracking (separate from LLM quota tracking)
 
     def _get_embedding_with_rotation(self, text: str) -> Optional[List[float]]:
         """Get embedding with model rotation"""
+        global quota_exceeded_embedding_models
+        
         if DEV_MODE:
             print(f"DEV_MODE: Creating mock embedding for text: {text[:50]}...")
             import hashlib
@@ -390,11 +415,11 @@ class GoogleAIEmbeddings(Embeddings):
             return mock_embedding
 
         # Try each embedding model
-        available_models = [m for m in self.embedding_models if m not in self.quota_exceeded_embedding_models]
+        available_models = [m for m in self.embedding_models if m not in quota_exceeded_embedding_models]
         
         if not available_models:
             # Reset if all models are quota-exceeded
-            self.quota_exceeded_embedding_models.clear()
+            quota_exceeded_embedding_models.clear()
             available_models = self.embedding_models
 
         for model_name in available_models:
@@ -450,7 +475,7 @@ class GoogleAIEmbeddings(Embeddings):
                 error_str = str(e)
                 if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted"]):
                     print(f"Embedding quota exceeded for {model_name}")
-                    self.quota_exceeded_embedding_models.add(model_name)
+                    quota_exceeded_embedding_models.add(model_name)
                     continue
                 else:
                     print(f"Embedding error with {model_name}: {e}")
@@ -941,7 +966,8 @@ async def debug_ai_status():
     """Debug endpoint to check AI provider status"""
     google_status = {
         "available_models": [m for m in GOOGLE_AI_MODELS if m not in quota_exceeded_models],
-        "quota_exceeded_models": list(quota_exceeded_models),
+        "quota_exceeded_llm_models": list(quota_exceeded_models),
+        "quota_exceeded_embedding_models": list(quota_exceeded_embedding_models),
         "total_google_models": len(GOOGLE_AI_MODELS)
     }
     
