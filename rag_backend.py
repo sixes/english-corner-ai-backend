@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.genai as genai
 from typing import List, Dict, Any, Optional
+import requests  # For Groq and other free AI APIs
 
 # LangChain imports
 from langchain.memory import ConversationBufferWindowMemory
@@ -28,6 +29,9 @@ load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     raise ValueError("GOOGLE_API_KEY environment variable not set. Please add it to your .env file.")
+
+# Optional: Groq API key for additional free models
+groq_api_key = os.getenv("GROQ_API_KEY")  # Optional fallback
 
 # Configure proxy settings only on macOS
 import platform
@@ -117,16 +121,34 @@ class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"  # Session ID for conversation tracking
 
-# Google AI model rotation configuration
+# Google AI model rotation configuration (expanded list)
 GOOGLE_AI_MODELS = [
-    "gemini-1.5-flash",      # Primary model (fast, efficient)
-    "gemini-1.5-pro",        # Secondary model (more capable) 
-    "gemini-1.0-pro",        # Fallback model
-    "gemini-2.0-flash-exp",  # Experimental model (if available)
+    "gemini-1.5-flash",           # Primary model (fast, efficient)
+    "gemini-1.5-pro",             # Secondary model (more capable) 
+    "gemini-1.0-pro",             # Stable fallback model
+    "gemini-2.0-flash-exp",       # Latest experimental
+    "gemini-1.5-flash-exp",       # Flash experimental
+    "gemini-1.5-pro-exp",         # Pro experimental
+    "gemini-exp-1114",            # Other experimental models
+    "gemini-exp-1121",            # Additional experimental
 ]
 
-# Track which models have hit quota limits
+# Track which models have hit quota limits (reset on startup)
 quota_exceeded_models = set()
+
+# Groq free models (as backup when Google AI exhausted)
+GROQ_MODELS = [
+    "llama-3.1-70b-versatile",    # Meta Llama 3.1 70B
+    "llama-3.1-8b-instant",       # Meta Llama 3.1 8B (faster)
+    "mixtral-8x7b-32768",         # Mixtral 8x7B
+    "gemma2-9b-it",               # Google Gemma 2 9B
+]
+
+def reset_quota_tracking():
+    """Reset quota tracking on startup or when needed"""
+    global quota_exceeded_models
+    quota_exceeded_models.clear()
+    print("Quota tracking reset - all models marked as available")
 
 # Custom Google AI LLM for LangChain
 class GoogleAILLM(LLM):
@@ -243,6 +265,109 @@ class GoogleAILLM(LLM):
         return (
             f"I'm sorry, but I'm currently experiencing technical difficulties with Google AI services. "
             f"Please try again in a moment. Technical details: {last_error}"
+        )
+
+# Groq LLM class for free fallback when Google AI is exhausted
+class GroqLLM(LLM):
+    """Custom Groq LLM wrapper for free API access as fallback"""
+    
+    def __init__(self, api_key: str = None, model_name: str = "llama-3.1-70b-versatile"):
+        super().__init__()
+        self.api_key = api_key or groq_api_key
+        self.model_name = model_name
+        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+        
+    @property
+    def _llm_type(self) -> str:
+        return "groq"
+    
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+    ) -> str:
+        """Call Groq API with the given prompt"""
+        if not self.api_key:
+            return "Groq API key not configured. Please add GROQ_API_KEY to your .env file."
+            
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 2000,
+            "temperature": 0.7
+        }
+        
+        try:
+            response = requests.post(self.base_url, headers=headers, json=data, timeout=30)
+            response.raise_for_status()
+            
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+            
+        except Exception as e:
+            return f"Groq API error: {str(e)}"
+
+# Multi-provider LLM that tries Google AI first, then Groq as fallback
+class MultiProviderLLM(LLM):
+    """LLM that tries Google AI models first, then falls back to Groq if all Google models are exhausted"""
+    
+    def __init__(self):
+        super().__init__()
+        self.google_llm = GoogleAILLM()
+        self.groq_llm = GroqLLM() if groq_api_key else None
+        
+    @property
+    def _llm_type(self) -> str:
+        return "multi_provider"
+    
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+    ) -> str:
+        """Try Google AI first, then Groq if all Google models exhausted"""
+        
+        # First try Google AI with all its models
+        try:
+            result = self.google_llm._call(prompt, stop, run_manager)
+            
+            # Check if Google AI returned a quota/limit error message
+            quota_indicators = [
+                "daily quota limits",
+                "technical difficulties with Google AI services",
+                "all Google AI models have reached their daily quota"
+            ]
+            
+            google_exhausted = any(indicator in result for indicator in quota_indicators)
+            
+            if not google_exhausted:
+                return result
+                
+        except Exception as e:
+            print(f"Google AI failed with exception: {e}")
+            google_exhausted = True
+        
+        # If Google AI is exhausted and we have Groq configured, try Groq
+        if google_exhausted and self.groq_llm:
+            print("Google AI exhausted, trying Groq as fallback...")
+            try:
+                result = self.groq_llm._call(prompt, stop, run_manager)
+                # Add a note that we're using fallback
+                return f"{result}\n\n*(Response generated using fallback AI service due to quota limits)*"
+            except Exception as e:
+                print(f"Groq also failed: {e}")
+        
+        # If both failed or Groq not configured, return Google AI result
+        return result if 'result' in locals() else (
+            "I'm sorry, but I'm currently experiencing technical difficulties with AI services. "
+            "Please try again later."
         )
 
 # Custom Google AI Embeddings for LangChain
@@ -766,8 +891,8 @@ If you don't find accurate answers in the context, try your best to answer the q
 Always answer the questions in the same language with the user quetsion. However, if you identify the user's English is poor, answer in both English and Chinese.
 Since you'are an assistant, always to encourage users to keep up and learn English. It would be better in a light and humurous way."""
 
-        # Get response from LLM directly
-        llm = GoogleAILLM()
+        # Get response from LLM with multi-provider fallback
+        llm = MultiProviderLLM()
         answer = llm._call(prompt)
 
         # Add to conversation memory
@@ -805,4 +930,26 @@ async def debug_sessions():
         "first_5_sessions": SESSIONS[:5] if SESSIONS else [],
         "vector_store_initialized": vector_store is not None,
         "active_chat_sessions": list(session_memories.keys())
+    }
+
+@app.get("/debug/ai-status")
+async def debug_ai_status():
+    """Debug endpoint to check AI provider status"""
+    google_status = {
+        "available_models": [m for m in GOOGLE_AI_MODELS if m not in quota_exceeded_models],
+        "quota_exceeded_models": list(quota_exceeded_models),
+        "total_google_models": len(GOOGLE_AI_MODELS)
+    }
+    
+    groq_status = {
+        "api_key_configured": bool(groq_api_key),
+        "available_models": GROQ_MODELS if groq_api_key else []
+    }
+    
+    return {
+        "google_ai": google_status,
+        "groq": groq_status,
+        "overall_status": "operational" if (
+            google_status["available_models"] or groq_status["api_key_configured"]
+        ) else "degraded"
     }
