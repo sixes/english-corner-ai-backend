@@ -61,10 +61,18 @@ app = FastAPI()
 # Add CORS middleware to allow frontend requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific domains
+    allow_origins=[
+        "https://www.englishcorner.cyou",
+        "https://englishcorner.cyou", 
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173"
+    ],  # Specific domains for production
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 SESSION_DATA_DIR = "/home/ef/fetch_ec_signup_data/sessions_data"  # Path where session JSON files are stored
@@ -886,6 +894,11 @@ async def startup_event():
 async def root():
     """Health check endpoint"""
     return {"message": "English Corner RAG Backend is running", "status": "healthy"}
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    """Handle preflight OPTIONS requests"""
+    return {"message": "OK"}
 
 @app.get("/health")
 async def health():
