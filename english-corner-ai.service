@@ -8,7 +8,7 @@ Type=simple
 User=ef
 Group=ef
 WorkingDirectory=/home/ef/english-corner-ai-backend
-Environment=PATH=/home/ef/english-corner-ai-backend/venv/bin
+Environment=PATH=/home/ef/english-corner-ai-backend/venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/ef/english-corner-ai-backend/venv/bin/uvicorn rag_backend:app --host 0.0.0.0 --port 8443 --workers 1
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
@@ -17,12 +17,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=english-corner-ai
 
-# Security settings
+# Simplified security settings for compatibility
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=strict
-ReadWritePaths=/home/ef/english-corner-ai-backend
-ProtectHome=yes
 
 [Install]
 WantedBy=multi-user.target
