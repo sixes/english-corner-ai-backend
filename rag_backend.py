@@ -319,8 +319,9 @@ class MultiProviderLLM(LLM):
     
     def __init__(self):
         super().__init__()
-        self.google_llm = GoogleAILLM()
-        self.groq_llm = GroqLLM() if groq_api_key else None
+        # Use object.__setattr__ to bypass Pydantic validation
+        object.__setattr__(self, '_google_llm', GoogleAILLM())
+        object.__setattr__(self, '_groq_llm', GroqLLM() if groq_api_key else None)
         
     @property
     def _llm_type(self) -> str:
@@ -336,7 +337,7 @@ class MultiProviderLLM(LLM):
         
         # First try Google AI with all its models
         try:
-            result = self.google_llm._call(prompt, stop, run_manager)
+            result = self._google_llm._call(prompt, stop, run_manager)
             
             # Check if Google AI returned a quota/limit error message
             quota_indicators = [
@@ -355,10 +356,10 @@ class MultiProviderLLM(LLM):
             google_exhausted = True
         
         # If Google AI is exhausted and we have Groq configured, try Groq
-        if google_exhausted and self.groq_llm:
+        if google_exhausted and self._groq_llm:
             print("Google AI exhausted, trying Groq as fallback...")
             try:
-                result = self.groq_llm._call(prompt, stop, run_manager)
+                result = self._groq_llm._call(prompt, stop, run_manager)
                 # Add a note that we're using fallback
                 return f"{result}\n\n*(Response generated using fallback AI service due to quota limits)*"
             except Exception as e:
@@ -805,6 +806,9 @@ async def startup_event():
     SESSIONS = load_sessions()
     print(f"Loaded {len(SESSIONS)} sessions.")
 
+    print("Resetting quota tracking...")
+    reset_quota_tracking()
+
     print("Setting up vector store...")
     setup_vector_store_and_chain()
     print("Setup complete!")
@@ -891,8 +895,8 @@ If you don't find accurate answers in the context, try your best to answer the q
 Always answer the questions in the same language with the user quetsion. However, if you identify the user's English is poor, answer in both English and Chinese.
 Since you'are an assistant, always to encourage users to keep up and learn English. It would be better in a light and humurous way."""
 
-        # Get response from LLM with multi-provider fallback
-        llm = MultiProviderLLM()
+        # Get response from LLM - using Google AI only
+        llm = GoogleAILLM()
         answer = llm._call(prompt)
 
         # Add to conversation memory
