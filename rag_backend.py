@@ -117,10 +117,225 @@ class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"  # Session ID for conversation tracking
 
+# Google AI model rotation configuration
+GOOGLE_AI_MODELS = [
+    "gemini-1.5-flash",      # Primary model (fast, efficient)
+    "gemini-1.5-pro",        # Secondary model (more capable) 
+    "gemini-1.0-pro",        # Fallback model
+    "gemini-2.0-flash-exp",  # Experimental model (if available)
+]
+
+# Track which models have hit quota limits
+quota_exceeded_models = set()
+
+# Custom Google AI LLM for LangChain
+class GoogleAILLM(LLM):
+    """Custom Google AI LLM wrapper with model rotation for quota management"""
+
+    def __init__(self, model_name: str = None, **kwargs):
+        super().__init__(**kwargs)
+        self._primary_model = model_name or "gemini-1.5-flash"
+
+    def _get_available_models(self) -> List[str]:
+        """Get list of available models that haven't exceeded quota"""
+        if DEV_MODE:
+            return GOOGLE_AI_MODELS
+            
+        try:
+            # Get actual available models from Google AI
+            models = client.models.list()
+            available_model_names = [model.name for model in models if hasattr(model, 'name')]
+            
+            # Filter out models that have exceeded quota and match our preferred list
+            available_models = []
+            for model in GOOGLE_AI_MODELS:
+                if model in available_model_names and model not in quota_exceeded_models:
+                    available_models.append(model)
+            
+            # If all preferred models are quota-exceeded, try other available models
+            if not available_models:
+                for model_name in available_model_names:
+                    if model_name not in quota_exceeded_models and 'gemini' in model_name.lower():
+                        available_models.append(model_name)
+            
+            return available_models
+            
+        except Exception as e:
+            print(f"Error getting available models: {e}")
+            # Fallback to our predefined list
+            return [model for model in GOOGLE_AI_MODELS if model not in quota_exceeded_models]
+
+    @property
+    def _llm_type(self) -> str:
+        return "google_genai_rotating"
+
+    def _call_with_model(self, prompt: str, model_name: str) -> str:
+        """Call Google AI with a specific model"""
+        try:
+            print(f"Calling Google AI with model: {model_name}")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            print(f"Success with model {model_name}")
+            return response.text
+            
+        except Exception as e:
+            error_str = str(e)
+            print(f"Error with model {model_name}: {error_str}")
+            
+            # Check if it's a quota error
+            if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "rate limit"]):
+                print(f"Quota exceeded for model {model_name}, marking as unavailable")
+                quota_exceeded_models.add(model_name)
+                raise Exception(f"QUOTA_EXCEEDED_{model_name}")
+            else:
+                # Other error, re-raise
+                raise e
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        if DEV_MODE:
+            return f"Mock response for development mode. Query: {prompt[:100]}..."
+
+        # Get available models
+        available_models = self._get_available_models()
+        
+        if not available_models:
+            # Reset quota tracking if all models are exhausted (maybe quotas have reset)
+            print("All models quota-exceeded, resetting quota tracking...")
+            quota_exceeded_models.clear()
+            available_models = self._get_available_models()
+        
+        if not available_models:
+            # Still no models available, return helpful error
+            return (
+                "I'm sorry, but all Google AI models have reached their daily quota limits. "
+                "This typically resets at midnight Pacific Time. Please try again later, "
+                "or consider upgrading to a paid Google AI plan for higher limits."
+            )
+
+        # Try each available model in order
+        last_error = None
+        for model_name in available_models:
+            try:
+                result = self._call_with_model(prompt, model_name)
+                return result
+                
+            except Exception as e:
+                last_error = str(e)
+                if "QUOTA_EXCEEDED" in last_error:
+                    print(f"Model {model_name} quota exceeded, trying next model...")
+                    continue
+                else:
+                    print(f"Model {model_name} failed with non-quota error: {last_error}")
+                    # For non-quota errors, still try next model but with a delay
+                    import time
+                    time.sleep(1)
+                    continue
+
+        # If we get here, all models failed
+        return (
+            f"I'm sorry, but I'm currently experiencing technical difficulties with Google AI services. "
+            f"Please try again in a moment. Technical details: {last_error}"
+        )
+
 # Custom Google AI Embeddings for LangChain
 class GoogleAIEmbeddings(Embeddings):
     def __init__(self, model_name: str = "text-embedding-004"):
         self.model_name = model_name
+        self.embedding_models = ["text-embedding-004", "text-embedding-003"]  # Alternative embedding models
+        self.quota_exceeded_embedding_models = set()
+
+    def _get_embedding_with_rotation(self, text: str) -> Optional[List[float]]:
+        """Get embedding with model rotation"""
+        if DEV_MODE:
+            print(f"DEV_MODE: Creating mock embedding for text: {text[:50]}...")
+            import hashlib
+            import numpy as np
+            text_hash = hashlib.md5(text.encode()).hexdigest()
+            np.random.seed(int(text_hash[:8], 16))
+            mock_embedding = np.random.normal(0, 1, 768).tolist()
+            return mock_embedding
+
+        # Try each embedding model
+        available_models = [m for m in self.embedding_models if m not in self.quota_exceeded_embedding_models]
+        
+        if not available_models:
+            # Reset if all models are quota-exceeded
+            self.quota_exceeded_embedding_models.clear()
+            available_models = self.embedding_models
+
+        for model_name in available_models:
+            try:
+                print(f"Getting embedding with model: {model_name}")
+                
+                import signal
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Embedding API call timed out")
+
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(10)
+
+                try:
+                    response = client.models.embed_content(
+                        model=model_name,
+                        contents=text
+                    )
+                    signal.alarm(0)
+
+                    # Extract embedding data (same logic as before)
+                    if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
+                        embedding_obj = response.embeddings[0]
+                        if hasattr(embedding_obj, 'values'):
+                            embedding_data = embedding_obj.values
+                        else:
+                            embedding_data = embedding_obj
+                    elif hasattr(response, 'embedding'):
+                        embedding_obj = response.embedding
+                        if hasattr(embedding_obj, 'values'):
+                            embedding_data = embedding_obj.values
+                        else:
+                            embedding_data = embedding_obj
+                    elif hasattr(response, 'values'):
+                        embedding_data = response.values
+                    else:
+                        print(f"Unknown response format for {model_name}")
+                        continue
+
+                    if hasattr(embedding_data, 'values'):
+                        embedding_data = embedding_data.values
+
+                    if isinstance(embedding_data, (list, tuple)):
+                        embedding_list = [float(x) for x in embedding_data]
+                        if embedding_list and len(embedding_list) > 0:
+                            print(f"Embedding successful with {model_name}, got {len(embedding_list)} dimensions")
+                            return embedding_list
+
+                finally:
+                    signal.alarm(0)
+
+            except Exception as e:
+                error_str = str(e)
+                if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted"]):
+                    print(f"Embedding quota exceeded for {model_name}")
+                    self.quota_exceeded_embedding_models.add(model_name)
+                    continue
+                else:
+                    print(f"Embedding error with {model_name}: {e}")
+                    continue
+
+        print("All embedding models failed or quota exceeded")
+        return None
+
+    def _get_embedding(self, text: str) -> Optional[List[float]]:
+        """Use the new rotation method"""
+        return self._get_embedding_with_rotation(text)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         embeddings = []
@@ -136,144 +351,6 @@ class GoogleAIEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         embedding = self._get_embedding(text)
         return embedding if embedding else [0.0] * 768
-
-    def _get_embedding(self, text: str) -> Optional[List[float]]:
-        if DEV_MODE:
-            print(f"DEV_MODE: Creating mock embedding for text: {text[:50]}...")
-            # Return a mock embedding vector for development
-            import hashlib
-            import numpy as np
-            # Create a deterministic but pseudo-random embedding based on text hash
-            text_hash = hashlib.md5(text.encode()).hexdigest()
-            np.random.seed(int(text_hash[:8], 16))  # Use first 8 hex chars as seed
-            mock_embedding = np.random.normal(0, 1, 768).tolist()  # 768-dim mock embedding
-            return mock_embedding
-
-        try:
-            print(f"Getting embedding for text: {text[:50]}...")  # Debug output
-
-            # Add timeout handling
-            import signal
-
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Embedding API call timed out")
-
-            # Set a 10-second timeout for embedding calls
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)
-
-            try:
-                response = client.models.embed_content(
-                    model=self.model_name,
-                    contents=text
-                )
-                signal.alarm(0)  # Cancel the alarm
-
-                # The response object contains the embedding - need to extract properly
-                if hasattr(response, 'embeddings') and len(response.embeddings) > 0:
-                    # New API format: embeddings list with values
-                    embedding_obj = response.embeddings[0]
-                    if hasattr(embedding_obj, 'values'):
-                        embedding_data = embedding_obj.values
-                    else:
-                        embedding_data = embedding_obj
-                elif hasattr(response, 'embedding'):
-                    # Alternative format
-                    embedding_obj = response.embedding
-                    if hasattr(embedding_obj, 'values'):
-                        embedding_data = embedding_obj.values
-                    else:
-                        embedding_data = embedding_obj
-                elif hasattr(response, 'values'):
-                    # Direct values format
-                    embedding_data = response.values
-                else:
-                    print(f"Unknown response format, available attributes: {dir(response)}")
-                    return None
-
-                # Convert to list if needed
-                if hasattr(embedding_data, 'values'):
-                    embedding_data = embedding_data.values
-
-                # Ensure it's a list of floats
-                if isinstance(embedding_data, (list, tuple)):
-                    embedding_list = [float(x) for x in embedding_data]
-                else:
-                    print(f"Embedding data type not supported: {type(embedding_data)}")
-                    return None
-
-                if embedding_list and len(embedding_list) > 0:
-                    print(f"Embedding successful, got {len(embedding_list)} dimensions")
-                    return embedding_list
-                else:
-                    print(f"No embedding data found in response")
-                    return None
-            finally:
-                signal.alarm(0)  # Ensure alarm is cancelled
-
-        except TimeoutError:
-            print(f"Embedding API timeout for text: {text[:50]}")
-            return None
-        except Exception as e:
-            print(f"Embedding error: {e}")
-            print(f"Error type: {type(e)}")
-            return None
-
-# Custom Google AI LLM for LangChain
-class GoogleAILLM(LLM):
-    """Custom Google AI LLM wrapper for LangChain"""
-
-    def __init__(self, model_name: str = None, **kwargs):
-        super().__init__(**kwargs)
-        self._model_name = model_name or self._get_best_model()
-
-    def _get_best_model(self) -> str:
-        if DEV_MODE:
-            print("DEV_MODE: Using mock model name")
-            return "gemini-1.5-flash"  # Mock model name for development
-
-        try:
-            # List available models with the new API
-            models = client.models.list()
-            model_names = [model.name for model in models]
-
-            # Prefer newer Gemini models
-            for model_candidate in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
-                if model_candidate in model_names:
-                    return model_candidate
-
-            # Fallback to first available model
-            return model_names[0] if model_names else "gemini-1.5-flash"
-        except Exception as e:
-            print(f"Error getting models: {e}")
-            return "gemini-1.5-flash"
-
-    @property
-    def _llm_type(self) -> str:
-        return "google_genai"
-
-    def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> str:
-        if DEV_MODE:
-            # Return a mock response for development
-            return f"Mock response for development mode. Query: {prompt[:100]}..."
-
-        try:
-            print(f"Calling Google AI with model: {self._model_name}")  # Debug log
-            response = client.models.generate_content(
-                model=self._model_name,
-                contents=prompt
-            )
-            print(f"Got response from Google AI: {response.text[:100]}...")  # Debug log
-            return response.text
-        except Exception as e:
-            print(f"Google AI error: {e}")  # Debug log
-            raise HTTPException(status_code=500, detail=f"Failed to get response from Google AI: {e}")
 
 # Global memory storage for different sessions
 session_memories: Dict[str, ConversationBufferWindowMemory] = {}
