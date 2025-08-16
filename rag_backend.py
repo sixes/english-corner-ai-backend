@@ -169,9 +169,21 @@ class GoogleAILLM(LLM):
         
         try:
             # Get actual available models from Google AI
+            print("[DEBUG] Calling client.models.list()...")
             models = client.models.list()
-            available_model_names = [model.name for model in models if hasattr(model, 'name')]
+            print(f"[DEBUG] Raw models response: {models}")
+            
+            available_model_names = []
+            for model in models:
+                print(f"[DEBUG] Processing model: {model}")
+                if hasattr(model, 'name'):
+                    available_model_names.append(model.name)
+                    print(f"[DEBUG] Added model name: {model.name}")
+                else:
+                    print(f"[DEBUG] Model has no 'name' attribute: {model}")
+            
             print(f"[DEBUG] Google AI reports {len(available_model_names)} total models available")
+            print(f"[DEBUG] Available model names: {available_model_names}")
             
             # Filter out models that have exceeded quota and match our preferred list
             available_models = []
@@ -196,10 +208,16 @@ class GoogleAILLM(LLM):
             return available_models
             
         except Exception as e:
-            print(f"Error getting available models: {e}")
-            # Fallback to our predefined list
+            print(f"[ERROR] Exception getting available models: {e}")
+            import traceback
+            print(f"[ERROR] Full traceback: {traceback.format_exc()}")
+            # Fallback to our predefined list when API listing fails
             fallback_models = [model for model in GOOGLE_AI_MODELS if model not in quota_exceeded_models]
-            print(f"[DEBUG] Using fallback models: {fallback_models}")
+            print(f"[DEBUG] API listing failed, using fallback models: {fallback_models}")
+            # If no fallback models available, at least try the most common one
+            if not fallback_models:
+                print("[DEBUG] No fallback models, trying gemini-1.5-flash as last resort")
+                fallback_models = ["gemini-1.5-flash"]
             return fallback_models
 
     @property
@@ -960,6 +978,36 @@ async def debug_sessions():
         "vector_store_initialized": vector_store is not None,
         "active_chat_sessions": list(session_memories.keys())
     }
+
+@app.get("/debug/test-google-ai")
+async def test_google_ai():
+    """Test Google AI API directly"""
+    try:
+        # Test 1: Direct model call without listing
+        print("[TEST] Testing direct model call...")
+        test_prompt = "Hello, please respond with 'API test successful'"
+        
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=test_prompt
+        )
+        
+        return {
+            "test": "direct_model_call",
+            "status": "success",
+            "response": response.text,
+            "model_used": "gemini-1.5-flash"
+        }
+        
+    except Exception as e:
+        print(f"[TEST ERROR] Direct model call failed: {e}")
+        import traceback
+        return {
+            "test": "direct_model_call", 
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
 
 @app.get("/debug/ai-status")
 async def debug_ai_status():
