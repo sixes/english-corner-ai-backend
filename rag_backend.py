@@ -203,13 +203,17 @@ class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"  # Session ID for conversation tracking
 
-# Google AI model rotation configuration (updated with latest models)
+# Google AI model rotation configuration (updated with working models)
 GOOGLE_AI_MODELS = [
-    "gemini-2.0-flash-exp",       # Latest Gemini 2.0 Flash (experimental)
-    "gemini-1.5-flash",           # Stable Gemini 1.5 Flash
-    "gemini-1.5-pro",             # Gemini 1.5 Pro (more capable)
-    "gemini-2.5-flash-exp",       # Gemini 2.5 Flash (if available)
-    # Note: Removed models that consistently return 404 errors
+    "gemini-2.5-flash",           # ✅ Working! New Gemini 2.5 Flash (not hitting quota yet)
+    "gemini-2.0-flash-exp",       # ⚠️ Quota exhausted but exists
+    "gemini-1.5-flash",           # ⚠️ Quota exhausted but exists  
+    "gemini-1.5-pro",             # ⚠️ Quota exhausted but exists
+    # Removed non-existent models that return 404:
+    # "gemini-2.5-flash-exp" - 404 not found
+    # "gemini-1.0-pro" - 404 not found
+    # "gemini-1.5-flash-exp" - 404 not found
+    # "gemini-1.5-pro-exp" - 404 not found
 ]
 
 # This will be populated with actual available models at startup
