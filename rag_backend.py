@@ -61,6 +61,7 @@ app = FastAPI()
 # Add CORS middleware to allow frontend requests
 app.add_middleware(
     CORSMiddleware,
+    allow_origin_regex=r"^https://english-corner-ai-frontend-[a-zA-Z0-9\-]+-sixes2010-3296s-projects\.vercel\.app/?$",
     allow_origins=[
         "https://www.englishcorner.cyou",
         "https://englishcorner.cyou", 
