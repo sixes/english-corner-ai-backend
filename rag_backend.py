@@ -337,23 +337,29 @@ def discover_available_models():
         # If discovery failed but we want to test our fallback models
         if not AVAILABLE_GOOGLE_AI_MODELS and len(full_model_names) == 0:
             logger.info("Since model discovery failed, testing our fallback models directly...")
-            for test_model in GOOGLE_AI_MODELS[:2]:  # Test first 2 models
-                try:
-                    logger.info(f"Testing fallback model: {test_model}")
-                    test_response = client.models.generate_content(
-                        model=test_model,
-                        contents="Hello"
-                    )
-                    logger.info(f"Fallback model {test_model} works! Adding to available models.")
-                    AVAILABLE_GOOGLE_AI_MODELS.append(test_model)
-                    break  # If one works, we're good
-                except Exception as e:
-                    logger.warning(f"Fallback model {test_model} failed: {e}")
-                    continue
+            # Skip testing if we already know there's a quota issue
+            if model_count == 0:
+                logger.warning("Skipping individual model tests since models.list() returned empty")
+                logger.warning("This typically indicates quota exhaustion or API access restrictions")
+            else:
+                for test_model in GOOGLE_AI_MODELS[:2]:  # Test first 2 models
+                    try:
+                        logger.info(f"Testing fallback model: {test_model}")
+                        test_response = client.models.generate_content(
+                            model=test_model,
+                            contents="Hello"
+                        )
+                        logger.info(f"Fallback model {test_model} works! Adding to available models.")
+                        AVAILABLE_GOOGLE_AI_MODELS.append(test_model)
+                        break  # If one works, we're good
+                    except Exception as e:
+                        logger.warning(f"Fallback model {test_model} failed: {e}")
+                        continue
         
         # Final fallback
         if not AVAILABLE_GOOGLE_AI_MODELS:
             logger.warning("No Google AI models discovered or tested successfully - using fallback list")
+            logger.info("Note: Models in fallback list may still hit quota limits at runtime")
             AVAILABLE_GOOGLE_AI_MODELS = GOOGLE_AI_MODELS
             
     except Exception as e:
@@ -524,9 +530,20 @@ class GoogleAILLM(LLM):
         # Provide more helpful error message based on the type of failures
         if models_tried:
             if quota_errors >= len(models_tried):
+                # Calculate hours until midnight PT (UTC-8)
+                import datetime
+                now_utc = datetime.datetime.utcnow()
+                # Convert to PT (UTC-8)
+                pt_offset = datetime.timedelta(hours=-8)
+                now_pt = now_utc + pt_offset
+                # Calculate hours until next midnight PT
+                tomorrow_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+                hours_until_reset = int((tomorrow_pt - now_pt).total_seconds() / 3600)
+                
                 return (
-                    f"I'm sorry, but all Google AI models have reached their daily quota limits. "
-                    f"The free tier has daily usage limits that reset at midnight Pacific Time. "
+                    f"I'm sorry, but Google AI has reached its daily quota limits. "
+                    f"The free tier allows 50 requests per day per model, and this limit has been exceeded. "
+                    f"The quota resets at midnight Pacific Time (approximately {hours_until_reset} hours from now). "
                     f"You can try again later, or upgrade to a paid Google AI plan for higher limits. "
                     f"Models attempted: {', '.join(models_tried[:3])}{'...' if len(models_tried) > 3 else ''}"
                 )
@@ -634,7 +651,8 @@ class MultiProviderLLM(LLM):
             quota_indicators = [
                 "daily quota limits",
                 "technical difficulties with Google AI services",
-                "all Google AI models have reached their daily quota"
+                "all Google AI models have reached their daily quota",
+                "quota limits that reset at midnight Pacific Time"
             ]
             
             google_exhausted = any(indicator in result for indicator in quota_indicators)
@@ -643,24 +661,46 @@ class MultiProviderLLM(LLM):
                 return result
                 
         except Exception as e:
-            logger.warning(f"Google AI failed with exception: {e}")
-            google_exhausted = True
+            error_str = str(e)
+            # Check if the exception itself indicates quota exhaustion
+            if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "exceeded your current quota"]):
+                logger.warning(f"Google AI quota exhausted at MultiProvider level: {e}")
+                google_exhausted = True
+            else:
+                logger.warning(f"Google AI failed with exception: {e}")
+                google_exhausted = True
         
         # If Google AI is exhausted and we have Groq configured, try Groq
         if google_exhausted and self._groq_llm:
-            logger.info("Google AI exhausted, trying Groq as fallback...")
+            logger.info("Google AI exhausted, automatically switching to Groq fallback...")
             try:
                 result = self._groq_llm._call(prompt, stop, run_manager)
                 # Add a note that we're using fallback
-                return f"{result}\n\n*(Response generated using fallback AI service due to quota limits)*"
+                return f"{result}\n\n*(Response generated using Groq AI due to Google AI quota limits)*"
             except Exception as e:
                 logger.error(f"Groq also failed: {e}")
         
-        # If both failed or Groq not configured, return Google AI result
-        return result if 'result' in locals() else (
-            "I'm sorry, but I'm currently experiencing technical difficulties with AI services. "
-            "Please try again later."
-        )
+        # If both failed or Groq not configured, return helpful message
+        if google_exhausted:
+            if self._groq_llm:
+                return (
+                    "I'm sorry, but both Google AI and Groq services are currently unavailable. "
+                    "Google AI has reached its daily quota limits, and the Groq fallback also failed. "
+                    "Please try again later or contact the administrator."
+                )
+            else:
+                return (
+                    "I'm sorry, but Google AI has reached its daily quota limits (50 requests per day on free tier). "
+                    "The quota resets at midnight Pacific Time. You can:\n"
+                    "1. Try again after midnight PT\n"
+                    "2. Upgrade to a paid Google AI plan for higher limits\n"
+                    "3. Ask the administrator to configure Groq as a fallback service"
+                )
+        else:
+            return result if 'result' in locals() else (
+                "I'm sorry, but I'm currently experiencing technical difficulties with AI services. "
+                "Please try again later."
+            )
 
 # Custom Google AI Embeddings for LangChain
 class GoogleAIEmbeddings(Embeddings):
