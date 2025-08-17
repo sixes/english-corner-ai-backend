@@ -203,15 +203,13 @@ class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"  # Session ID for conversation tracking
 
-# Google AI model rotation configuration (updated with stable models first)
+# Google AI model rotation configuration (updated with latest models)
 GOOGLE_AI_MODELS = [
-    "gemini-1.5-flash",           # Primary model (fast, efficient)
-    "gemini-1.5-pro",             # Secondary model (more capable) 
-    "gemini-2.0-flash-exp",       # Latest experimental (if available)
-    # Removed models that are consistently returning 404 errors:
-    # "gemini-1.0-pro" - deprecated
-    # "gemini-1.5-flash-exp" - not found
-    # "gemini-1.5-pro-exp" - not found
+    "gemini-2.0-flash-exp",       # Latest Gemini 2.0 Flash (experimental)
+    "gemini-1.5-flash",           # Stable Gemini 1.5 Flash
+    "gemini-1.5-pro",             # Gemini 1.5 Pro (more capable)
+    "gemini-2.5-flash-exp",       # Gemini 2.5 Flash (if available)
+    # Note: Removed models that consistently return 404 errors
 ]
 
 # This will be populated with actual available models at startup
@@ -1528,3 +1526,120 @@ async def debug_discover_models():
             "error": str(e),
             "traceback": traceback.format_exc()
         }
+
+@app.get("/debug/test-model/{model_name}")
+async def debug_test_specific_model(model_name: str):
+    """Test a specific model directly"""
+    try:
+        logger.info(f"Testing specific model: {model_name}")
+        
+        # Test the model directly
+        try:
+            test_response = client.models.generate_content(
+                model=model_name,
+                contents="Hello, please respond briefly to confirm this model works."
+            )
+            
+            return {
+                "model": model_name,
+                "status": "success",
+                "response": test_response.text,
+                "message": f"Model {model_name} is working correctly"
+            }
+            
+        except Exception as e:
+            error_str = str(e)
+            
+            # Categorize the error
+            if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "exceeded your current quota"]):
+                error_type = "quota_exhausted"
+                message = "Model exists but quota limit reached"
+            elif any(keyword in error_str.lower() for keyword in ["404", "not_found", "not found", "is not found"]):
+                error_type = "model_not_found"
+                message = "Model does not exist or is not accessible"
+            elif any(keyword in error_str.lower() for keyword in ["connection", "timeout", "proxy", "network"]):
+                error_type = "network_error"
+                message = "Network or connectivity issue"
+            else:
+                error_type = "unknown_error"
+                message = "Unknown error occurred"
+            
+            return {
+                "model": model_name,
+                "status": "error",
+                "error_type": error_type,
+                "error_message": error_str,
+                "message": message
+            }
+            
+    except Exception as e:
+        import traceback
+        return {
+            "model": model_name,
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+@app.get("/debug/test-all-models")
+async def debug_test_all_models():
+    """Test all models in our list to see which ones work"""
+    results = {}
+    
+    test_models = [
+        "gemini-2.0-flash-exp",
+        "gemini-1.5-flash", 
+        "gemini-1.5-pro",
+        "gemini-2.5-flash-exp",
+        "gemini-1.0-pro",  # Test this too even though it might be deprecated
+        "gemini-1.5-flash-exp",
+        "gemini-1.5-pro-exp"
+    ]
+    
+    for model_name in test_models:
+        try:
+            logger.info(f"Testing model: {model_name}")
+            
+            test_response = client.models.generate_content(
+                model=model_name,
+                contents="Hi"
+            )
+            
+            results[model_name] = {
+                "status": "success",
+                "response": test_response.text[:100] + "..." if len(test_response.text) > 100 else test_response.text
+            }
+            
+        except Exception as e:
+            error_str = str(e)
+            
+            if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted"]):
+                status = "quota_exhausted"
+            elif any(keyword in error_str.lower() for keyword in ["404", "not_found"]):
+                status = "not_found"
+            else:
+                status = "error"
+            
+            results[model_name] = {
+                "status": status,
+                "error": error_str[:200] + "..." if len(error_str) > 200 else error_str
+            }
+    
+    # Summary
+    working_models = [model for model, result in results.items() if result["status"] == "success"]
+    quota_models = [model for model, result in results.items() if result["status"] == "quota_exhausted"]
+    missing_models = [model for model, result in results.items() if result["status"] == "not_found"]
+    
+    return {
+        "results": results,
+        "summary": {
+            "working_models": working_models,
+            "quota_exhausted_models": quota_models,
+            "missing_models": missing_models,
+            "total_tested": len(test_models)
+        },
+        "recommendation": {
+            "available_models": working_models,
+            "should_update_list": missing_models
+        }
+    }
