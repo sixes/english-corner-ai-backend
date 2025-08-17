@@ -129,16 +129,15 @@ class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"  # Session ID for conversation tracking
 
-# Google AI model rotation configuration (expanded list)
+# Google AI model rotation configuration (updated with stable models first)
 GOOGLE_AI_MODELS = [
     "gemini-1.5-flash",           # Primary model (fast, efficient)
     "gemini-1.5-pro",             # Secondary model (more capable) 
     "gemini-1.0-pro",             # Stable fallback model
-    "gemini-2.0-flash-exp",       # Latest experimental
-    "gemini-1.5-flash-exp",       # Flash experimental
-    "gemini-1.5-pro-exp",         # Pro experimental
-    "gemini-exp-1114",            # Other experimental models
-    "gemini-exp-1121",            # Additional experimental
+    "gemini-2.0-flash-exp",       # Latest experimental (if available)
+    "gemini-1.5-flash-exp",       # Flash experimental (if available)
+    "gemini-1.5-pro-exp",         # Pro experimental (if available)
+    # Removed gemini-exp-1121 as it's causing 404 errors
 ]
 
 # Track which models have hit quota limits (reset on startup)
@@ -273,8 +272,14 @@ class GoogleAILLM(LLM):
             error_str = str(e)
             print(f"Error with model {model_name}: {error_str}")
             
+            # Check if it's a 404 or model not found error
+            if any(keyword in error_str.lower() for keyword in ["404", "not_found", "not found", "is not found"]):
+                print(f"Model {model_name} not found (404), marking as unavailable and trying next model")
+                quota_exceeded_models.add(model_name)
+                raise Exception(f"MODEL_NOT_FOUND_{model_name}")
+            
             # Check if it's a quota error
-            if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "rate limit"]):
+            elif any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "rate limit"]):
                 print(f"Quota exceeded for model {model_name}, marking as unavailable")
                 quota_exceeded_models.add(model_name)
                 raise Exception(f"QUOTA_EXCEEDED_{model_name}")
@@ -1021,32 +1026,67 @@ async def debug_sessions():
 @app.get("/debug/test-google-ai")
 async def test_google_ai():
     """Test Google AI API directly"""
-    try:
-        # Test 1: Direct model call without listing
-        print("[TEST] Testing direct model call...")
-        test_prompt = "Hello, please respond with 'API test successful'"
-        
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=test_prompt
-        )
-        
+    # Get available models
+    available_models = [m for m in GOOGLE_AI_MODELS if m not in quota_exceeded_models]
+    
+    if not available_models:
         return {
             "test": "direct_model_call",
-            "status": "success",
-            "response": response.text,
-            "model_used": "gemini-1.5-flash"
+            "status": "error", 
+            "error": "No available models - all quota exceeded or unavailable"
         }
-        
-    except Exception as e:
-        print(f"[TEST ERROR] Direct model call failed: {e}")
-        import traceback
-        return {
-            "test": "direct_model_call", 
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
+    
+    # Try each available model
+    for model_name in available_models:
+        try:
+            print(f"[TEST] Testing model: {model_name}")
+            test_prompt = "Hello, please respond with 'API test successful'"
+            
+            response = client.models.generate_content(
+                model=model_name,
+                contents=test_prompt
+            )
+            
+            return {
+                "test": "direct_model_call",
+                "status": "success",
+                "response": response.text,
+                "model_used": model_name
+            }
+            
+        except Exception as e:
+            error_str = str(e)
+            print(f"[TEST ERROR] Model {model_name} failed: {error_str}")
+            
+            # Check if it's a 404 or model not found error
+            if any(keyword in error_str.lower() for keyword in ["404", "not_found", "not found", "is not found"]):
+                print(f"Model {model_name} not found (404), marking as unavailable")
+                quota_exceeded_models.add(model_name)
+                continue  # Try next model
+            
+            # Check if it's a quota error
+            elif any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "rate limit"]):
+                print(f"Quota exceeded for model {model_name}, marking as unavailable")
+                quota_exceeded_models.add(model_name)
+                continue  # Try next model
+            else:
+                # Other error, return it
+                import traceback
+                return {
+                    "test": "direct_model_call", 
+                    "status": "error",
+                    "error": str(e),
+                    "model_tested": model_name,
+                    "traceback": traceback.format_exc()
+                }
+    
+    # If we get here, all models failed
+    return {
+        "test": "direct_model_call",
+        "status": "error",
+        "error": "All available models failed",
+        "quota_exceeded_models": list(quota_exceeded_models)
+    }
 
 @app.get("/debug/ai-status")
 async def debug_ai_status():
