@@ -242,6 +242,7 @@ def discover_available_models():
     
     try:
         logger.info("Discovering available Google AI models...")
+        logger.info(f"Using API key: {api_key[:10]}...{api_key[-5:] if len(api_key) > 15 else '***'}")
         
         # Try to list models with timeout and better error handling
         import signal
@@ -252,16 +253,24 @@ def discover_available_models():
         signal.alarm(30)  # 30 second timeout
         
         try:
+            logger.info("Calling client.models.list()...")
             models_pager = client.models.list()
+            logger.info(f"Got models_pager: {type(models_pager)}")
             signal.alarm(0)  # Cancel timeout
             
             discovered_models = []
             full_model_names = []
+            model_count = 0
             
+            logger.info("Iterating through models...")
             for model in models_pager:
+                model_count += 1
+                logger.info(f"Processing model #{model_count}: {model}")
+                
                 if hasattr(model, 'name'):
                     full_model_name = model.name
                     full_model_names.append(full_model_name)
+                    logger.info(f"Model name: {full_model_name}")
                     
                     # Extract short model name from full path (e.g., "models/gemini-1.5-flash" -> "gemini-1.5-flash")
                     if full_model_name.startswith('models/'):
@@ -273,9 +282,31 @@ def discover_available_models():
                     if any(keyword in model_name.lower() for keyword in ['gemini']):  # Focus on gemini models
                         discovered_models.append(model_name)
                         logger.info(f"Discovered model: {model_name} (full name: {full_model_name})")
+                else:
+                    logger.warning(f"Model has no 'name' attribute: {model}")
             
+            logger.info(f"Iteration completed. Total models processed: {model_count}")
             logger.info(f"Total models from API: {len(full_model_names)}")
+            logger.info(f"All model names: {full_model_names}")
             logger.info(f"Filtered Gemini models: {discovered_models}")
+            
+            # If we got no models at all, there's an API issue
+            if model_count == 0:
+                logger.error("No models returned from Google AI API - this indicates an API access problem")
+                logger.info("Possible causes: 1) Invalid API key, 2) Network/proxy issues, 3) API service down, 4) Rate limiting")
+                
+                # Try a simple test API call to verify connectivity
+                try:
+                    logger.info("Testing API connectivity with a simple generate_content call...")
+                    test_response = client.models.generate_content(
+                        model="gemini-1.5-flash",  # Try the most common model
+                        contents="Hello"
+                    )
+                    logger.info("API connectivity test successful - API key and network are working")
+                    logger.info("The models.list() endpoint might be restricted or temporarily unavailable")
+                except Exception as e:
+                    logger.error(f"API connectivity test failed: {e}")
+                    logger.error("This confirms there's an issue with API access or authentication")
             
             # Prioritize our preferred models, then add any others found
             prioritized_models = []
@@ -303,21 +334,26 @@ def discover_available_models():
         finally:
             signal.alarm(0)  # Ensure timeout is cancelled
         
-        # Test the first model to make sure it works (only if we have models)
-        if AVAILABLE_GOOGLE_AI_MODELS:
-            try:
-                logger.info(f"Testing first discovered model: {AVAILABLE_GOOGLE_AI_MODELS[0]}")
-                test_response = client.models.generate_content(
-                    model=AVAILABLE_GOOGLE_AI_MODELS[0],
-                    contents="Hello"
-                )
-                logger.info(f"First model test successful: {AVAILABLE_GOOGLE_AI_MODELS[0]}")
-            except Exception as e:
-                logger.warning(f"First model test failed: {e}, will use fallback list")
-                AVAILABLE_GOOGLE_AI_MODELS = GOOGLE_AI_MODELS
+        # If discovery failed but we want to test our fallback models
+        if not AVAILABLE_GOOGLE_AI_MODELS and len(full_model_names) == 0:
+            logger.info("Since model discovery failed, testing our fallback models directly...")
+            for test_model in GOOGLE_AI_MODELS[:2]:  # Test first 2 models
+                try:
+                    logger.info(f"Testing fallback model: {test_model}")
+                    test_response = client.models.generate_content(
+                        model=test_model,
+                        contents="Hello"
+                    )
+                    logger.info(f"Fallback model {test_model} works! Adding to available models.")
+                    AVAILABLE_GOOGLE_AI_MODELS.append(test_model)
+                    break  # If one works, we're good
+                except Exception as e:
+                    logger.warning(f"Fallback model {test_model} failed: {e}")
+                    continue
         
+        # Final fallback
         if not AVAILABLE_GOOGLE_AI_MODELS:
-            logger.warning("No Google AI models discovered - using fallback list")
+            logger.warning("No Google AI models discovered or tested successfully - using fallback list")
             AVAILABLE_GOOGLE_AI_MODELS = GOOGLE_AI_MODELS
             
     except Exception as e:
@@ -1379,4 +1415,76 @@ async def debug_model_test():
         return {
             "status": "error",
             "error": f"Failed to test models: {str(e)}"
+        }
+
+@app.get("/debug/discover-models")
+async def debug_discover_models():
+    """Manually trigger model discovery for debugging"""
+    try:
+        logger.info("Manual model discovery triggered...")
+        
+        # Test basic API connectivity first
+        try:
+            logger.info("Testing basic API connectivity...")
+            test_response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents="Test"
+            )
+            api_working = True
+            api_test_result = "Success"
+        except Exception as e:
+            api_working = False
+            api_test_result = str(e)
+        
+        # Try model listing
+        try:
+            logger.info("Testing models.list() API...")
+            models_pager = client.models.list()
+            models_list = []
+            
+            for i, model in enumerate(models_pager):
+                if i >= 20:  # Limit to prevent too much output
+                    break
+                models_list.append({
+                    "index": i,
+                    "model": str(model),
+                    "name": getattr(model, 'name', 'No name'),
+                    "attributes": [attr for attr in dir(model) if not attr.startswith('_')]
+                })
+            
+            models_list_result = "Success"
+            models_count = len(models_list)
+            
+        except Exception as e:
+            models_list = []
+            models_list_result = str(e)
+            models_count = 0
+        
+        # Trigger discovery function
+        old_available = AVAILABLE_GOOGLE_AI_MODELS.copy()
+        discover_available_models()
+        new_available = AVAILABLE_GOOGLE_AI_MODELS.copy()
+        
+        return {
+            "api_connectivity_test": {
+                "working": api_working,
+                "result": api_test_result
+            },
+            "models_list_test": {
+                "result": models_list_result,
+                "models_count": models_count,
+                "models": models_list
+            },
+            "discovery_results": {
+                "old_available_models": old_available,
+                "new_available_models": new_available,
+                "quota_exceeded": list(quota_exceeded_models)
+            }
+        }
+        
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
         }
