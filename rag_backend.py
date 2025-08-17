@@ -2,9 +2,12 @@ import os
 import json
 import glob
 import numpy as np
+import logging
+import time
+import uuid
 from datetime import datetime
 from collections import Counter
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -25,6 +28,24 @@ from langchain_core.runnables import ConfigurableField
 from langchain_core.retrievers import BaseRetriever
 
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('rag_backend.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Create a separate logger for request/response logging
+request_logger = logging.getLogger('request_response')
+request_logger.setLevel(logging.INFO)
+request_handler = logging.FileHandler('requests.log')
+request_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+request_logger.addHandler(request_handler)
 
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
@@ -57,6 +78,58 @@ client = genai.Client(api_key=api_key)
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 
 app = FastAPI()
+
+# Middleware for logging all requests and responses
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # Generate unique request ID
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+    
+    # Log request details
+    request_body = None
+    if request.method in ["POST", "PUT", "PATCH"]:
+        try:
+            body = await request.body()
+            if body:
+                request_body = body.decode('utf-8')
+        except Exception as e:
+            request_body = f"Error reading body: {str(e)}"
+    
+    request_info = {
+        "request_id": request_id,
+        "method": request.method,
+        "url": str(request.url),
+        "headers": dict(request.headers),
+        "client_ip": request.client.host if request.client else "unknown",
+        "body": request_body,
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    request_logger.info(f"REQUEST [{request_id}]: {json.dumps(request_info, ensure_ascii=False)}")
+    
+    # Process the request
+    response = await call_next(request)
+    
+    # Calculate processing time
+    process_time = time.time() - start_time
+    
+    # Log response details
+    response_info = {
+        "request_id": request_id,
+        "status_code": response.status_code,
+        "headers": dict(response.headers),
+        "process_time_seconds": round(process_time, 4),
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    request_logger.info(f"RESPONSE [{request_id}]: {json.dumps(response_info, ensure_ascii=False)}")
+    
+    # Add request ID to response headers for tracking
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    return response
 
 # Add CORS middleware to allow frontend requests
 app.add_middleware(
@@ -885,51 +958,59 @@ def get_top_attendee():
 @app.on_event("startup")
 async def startup_event():
     global SESSIONS
-    print("Loading sessions from files...")
+    logger.info("Starting up RAG Backend...")
+    logger.info("Loading sessions from files...")
     SESSIONS = load_sessions()
-    print(f"Loaded {len(SESSIONS)} sessions.")
+    logger.info(f"Loaded {len(SESSIONS)} sessions.")
 
-    print("Resetting quota tracking...")
+    logger.info("Resetting quota tracking...")
     reset_quota_tracking()
 
-    print("Setting up vector store...")
+    logger.info("Setting up vector store...")
     setup_vector_store_and_chain()
-    print("Setup complete!")
+    logger.info("Setup complete! Backend is ready to serve requests.")
 
 @app.get("/")
 async def root():
     """Health check endpoint"""
+    logger.info("Health check requested")
     return {"message": "English Corner RAG Backend is running", "status": "healthy"}
 
 @app.options("/{path:path}")
 async def options_handler(path: str):
     """Handle preflight OPTIONS requests"""
+    logger.debug(f"OPTIONS request for path: {path}")
     return {"message": "OK"}
 
 @app.get("/health")
 async def health():
     """Detailed health check"""
-    return {
+    logger.info("Detailed health check requested")
+    health_data = {
         "status": "healthy",
         "sessions_loaded": len(SESSIONS),
         "vector_store_ready": vector_store is not None,
         "active_chat_sessions": len(session_memories)
     }
+    logger.info(f"Health check result: {health_data}")
+    return health_data
 
 @app.post("/ask")
 async def ask(request: QuestionRequest):
     """Legacy endpoint for backward compatibility"""
-    print(f"Received request at /ask: {request.question}")  # Debug log
+    logger.info(f"Received request at /ask: {request.question}")
     return await chat(ChatRequest(question=request.question, session_id=request.session_id or "default"))
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    print(f"Received chat request: {request.question} (session: {request.session_id})")  # Debug log
+    logger.info(f"Received chat request: {request.question} (session: {request.session_id})")
     question = request.question.strip()
     if not question:
+        logger.warning("Empty question received")
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     session_id = request.session_id or "default"
+    logger.info(f"Processing question for session {session_id}: {question[:100]}...")
 
     # Get session-specific memory
     session_memory = get_memory_for_session(session_id)
@@ -937,23 +1018,38 @@ async def chat(request: ChatRequest):
     # Intent detection: direct logic for some queries (enhanced with context awareness)
     intent = detect_intent(question)
     if intent == "last_session_date":
+        logger.info(f"Detected intent: {intent}")
         answer = get_last_session_date()
         # Add to conversation memory
         session_memory.chat_memory.add_user_message(HumanMessage(content=question))
         session_memory.chat_memory.add_ai_message(AIMessage(content=answer))
-        return {"answer": answer, "session_id": session_id}
+        
+        # Log the response
+        response_data = {"answer": answer, "session_id": session_id}
+        logger.info(f"Intent-based response: {answer[:100]}...")
+        request_logger.info(f"CHAT_RESPONSE [session: {session_id}]: {json.dumps(response_data, ensure_ascii=False)}")
+        return response_data
+        
     elif intent == "top_participant":
+        logger.info(f"Detected intent: {intent}")
         answer = get_top_attendee()
         # Add to conversation memory
         session_memory.chat_memory.add_user_message(HumanMessage(content=question))
         session_memory.chat_memory.add_ai_message(AIMessage(content=answer))
-        return {"answer": answer, "session_id": session_id}
+        
+        # Log the response
+        response_data = {"answer": answer, "session_id": session_id}
+        logger.info(f"Intent-based response: {answer[:100]}...")
+        request_logger.info(f"CHAT_RESPONSE [session: {session_id}]: {json.dumps(response_data, ensure_ascii=False)}")
+        return response_data
 
     # Use a simpler approach without potential recursion issues
     try:
+        logger.info("Retrieving relevant documents from vector store...")
         # Get relevant documents from vector store
         retriever = vector_store.as_retriever(search_kwargs={"k": 3})
         relevant_docs = retriever.invoke(question)
+        logger.info(f"Retrieved {len(relevant_docs)} relevant documents")
 
         # Build context from retrieved documents
         context = "\n\n".join([doc.page_content for doc in relevant_docs])
@@ -983,9 +1079,11 @@ If you don't find accurate answers in the context, try your best to answer the q
 Always answer the questions in the same language with the user quetsion. However, if you identify the user's English is poor, answer in both English and Chinese.
 Since you'are an assistant, always to encourage users to keep up and learn English. It would be better in a light and humurous way."""
 
+        logger.info("Calling LLM for response generation...")
         # Get response from LLM - using Google AI only
         llm = GoogleAILLM()
         answer = llm._call(prompt)
+        logger.info(f"LLM response generated: {answer[:100]}...")
 
         # Add to conversation memory
         session_memory.chat_memory.add_user_message(HumanMessage(content=question))
@@ -995,23 +1093,39 @@ Since you'are an assistant, always to encourage users to keep up and learn Engli
         sources = [{"type": doc.metadata.get("type"), "id": doc.metadata.get("id")}
                   for doc in relevant_docs]
 
-        return {
+        response_data = {
             "answer": answer,
             "session_id": session_id,
             "sources_used": sources
         }
+        
+        # Log the complete response
+        request_logger.info(f"CHAT_RESPONSE [session: {session_id}]: {json.dumps(response_data, ensure_ascii=False)}")
+        logger.info(f"Chat response completed for session {session_id}")
+        
+        return response_data
 
     except Exception as e:
-        print(f"Chat error: {e}")  # Add debug logging
+        error_msg = f"Chat error: {e}"
+        logger.error(error_msg)
         import traceback
-        print(f"Full traceback: {traceback.format_exc()}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        
+        # Log the error response
+        error_response = {"error": str(e), "session_id": session_id}
+        request_logger.error(f"CHAT_ERROR [session: {session_id}]: {json.dumps(error_response, ensure_ascii=False)}")
+        
         raise HTTPException(status_code=500, detail=f"Failed to process chat: {e}")
 
 @app.post("/reset_session")
 async def reset_session(session_id: str = "default"):
     """Reset conversation memory for a specific session"""
+    logger.info(f"Resetting session: {session_id}")
     if session_id in session_memories:
         del session_memories[session_id]
+        logger.info(f"Session {session_id} reset successfully")
+    else:
+        logger.info(f"Session {session_id} not found in memory")
     return {"message": f"Session {session_id} reset successfully"}
 
 @app.get("/debug/sessions")
