@@ -207,11 +207,11 @@ class ChatRequest(BaseModel):
 GOOGLE_AI_MODELS = [
     "gemini-1.5-flash",           # Primary model (fast, efficient)
     "gemini-1.5-pro",             # Secondary model (more capable) 
-    "gemini-1.0-pro",             # Stable fallback model
     "gemini-2.0-flash-exp",       # Latest experimental (if available)
-    "gemini-1.5-flash-exp",       # Flash experimental (if available)
-    "gemini-1.5-pro-exp",         # Pro experimental (if available)
-    # Removed gemini-exp-1121 as it's causing 404 errors
+    # Removed models that are consistently returning 404 errors:
+    # "gemini-1.0-pro" - deprecated
+    # "gemini-1.5-flash-exp" - not found
+    # "gemini-1.5-pro-exp" - not found
 ]
 
 # This will be populated with actual available models at startup
@@ -242,40 +242,68 @@ def discover_available_models():
     
     try:
         logger.info("Discovering available Google AI models...")
-        models_pager = client.models.list()
         
-        discovered_models = []
-        for model in models_pager:
-            if hasattr(model, 'name'):
-                full_model_name = model.name
-                # Extract short model name from full path (e.g., "models/gemini-1.5-flash" -> "gemini-1.5-flash")
-                if full_model_name.startswith('models/'):
-                    model_name = full_model_name.replace('models/', '')
+        # Try to list models with timeout and better error handling
+        import signal
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Model discovery API call timed out")
+        
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(30)  # 30 second timeout
+        
+        try:
+            models_pager = client.models.list()
+            signal.alarm(0)  # Cancel timeout
+            
+            discovered_models = []
+            full_model_names = []
+            
+            for model in models_pager:
+                if hasattr(model, 'name'):
+                    full_model_name = model.name
+                    full_model_names.append(full_model_name)
+                    
+                    # Extract short model name from full path (e.g., "models/gemini-1.5-flash" -> "gemini-1.5-flash")
+                    if full_model_name.startswith('models/'):
+                        model_name = full_model_name.replace('models/', '')
+                    else:
+                        model_name = full_model_name
+                    
+                    # Filter for text generation models (not embedding or vision-only models)
+                    if any(keyword in model_name.lower() for keyword in ['gemini']):  # Focus on gemini models
+                        discovered_models.append(model_name)
+                        logger.info(f"Discovered model: {model_name} (full name: {full_model_name})")
+            
+            logger.info(f"Total models from API: {len(full_model_names)}")
+            logger.info(f"Filtered Gemini models: {discovered_models}")
+            
+            # Prioritize our preferred models, then add any others found
+            prioritized_models = []
+            
+            # First, add our preferred models that are actually available
+            for preferred_model in GOOGLE_AI_MODELS:
+                if preferred_model in discovered_models:
+                    prioritized_models.append(preferred_model)
+                    logger.info(f"Preferred model {preferred_model} is available")
                 else:
-                    model_name = full_model_name
-                
-                # Filter for text generation models (not embedding or vision-only models)
-                if any(keyword in model_name.lower() for keyword in ['gemini', 'text', 'chat']):
-                    discovered_models.append(model_name)
-                    logger.info(f"Discovered model: {model_name} (full name: {full_model_name})")
+                    logger.warning(f"Preferred model {preferred_model} not found in discovery")
+            
+            # Then add any other discovered models we haven't listed
+            for discovered_model in discovered_models:
+                if discovered_model not in prioritized_models:
+                    prioritized_models.append(discovered_model)
+                    logger.info(f"Adding additional discovered model: {discovered_model}")
+            
+            AVAILABLE_GOOGLE_AI_MODELS = prioritized_models
+            logger.info(f"Available Google AI models: {AVAILABLE_GOOGLE_AI_MODELS}")
+            
+        except TimeoutError:
+            logger.error("Model discovery timed out after 30 seconds")
+            raise
+        finally:
+            signal.alarm(0)  # Ensure timeout is cancelled
         
-        # Prioritize our preferred models, then add any others found
-        prioritized_models = []
-        
-        # First, add our preferred models that are actually available
-        for preferred_model in GOOGLE_AI_MODELS:
-            if preferred_model in discovered_models:
-                prioritized_models.append(preferred_model)
-        
-        # Then add any other discovered models we haven't listed
-        for discovered_model in discovered_models:
-            if discovered_model not in prioritized_models:
-                prioritized_models.append(discovered_model)
-        
-        AVAILABLE_GOOGLE_AI_MODELS = prioritized_models
-        logger.info(f"Available Google AI models: {AVAILABLE_GOOGLE_AI_MODELS}")
-        
-        # Test the first model to make sure it works
+        # Test the first model to make sure it works (only if we have models)
         if AVAILABLE_GOOGLE_AI_MODELS:
             try:
                 logger.info(f"Testing first discovered model: {AVAILABLE_GOOGLE_AI_MODELS[0]}")
@@ -294,6 +322,8 @@ def discover_available_models():
             
     except Exception as e:
         logger.error(f"Failed to discover Google AI models: {e}")
+        import traceback
+        logger.error(f"Discovery error traceback: {traceback.format_exc()}")
         logger.info("Using fallback model list")
         AVAILABLE_GOOGLE_AI_MODELS = GOOGLE_AI_MODELS
 
@@ -444,7 +474,7 @@ class GoogleAILLM(LLM):
                     logger.warning(f"Model {model_name} failed with error: {last_error}, trying next model...")
                     # For other errors, still try next model but with a delay
                     import time
-                    time.sleep(1)
+                    time.sleep(2)  # Increased delay to avoid rate limiting
                     continue
 
         # If we get here, all models failed
@@ -452,30 +482,30 @@ class GoogleAILLM(LLM):
         
         # Categorize the failures for better error messages
         network_errors = sum(1 for e in [last_error] if "NETWORK_ERROR" in str(e))
-        quota_errors = sum(1 for e in [last_error] if "QUOTA_EXCEEDED" in str(e))
+        quota_errors = len([m for m in models_tried if m in quota_exceeded_models])
         not_found_errors = sum(1 for e in [last_error] if "MODEL_NOT_FOUND" in str(e))
         
         # Provide more helpful error message based on the type of failures
         if models_tried:
-            if network_errors > 0:
+            if quota_errors >= len(models_tried):
+                return (
+                    f"I'm sorry, but all Google AI models have reached their daily quota limits. "
+                    f"The free tier has daily usage limits that reset at midnight Pacific Time. "
+                    f"You can try again later, or upgrade to a paid Google AI plan for higher limits. "
+                    f"Models attempted: {', '.join(models_tried[:3])}{'...' if len(models_tried) > 3 else ''}"
+                )
+            elif network_errors > 0:
                 return (
                     f"I'm sorry, but I'm experiencing network connectivity issues with Google AI services. "
                     f"This might be due to proxy settings or internet connection problems. "
                     f"Please check your network connection or try again later. "
                     f"Models attempted: {', '.join(models_tried[:3])}{'...' if len(models_tried) > 3 else ''}"
                 )
-            elif quota_errors > 0:
-                return (
-                    f"I'm sorry, but all Google AI models have reached their daily quota limits. "
-                    f"This typically resets at midnight Pacific Time. Please try again later, "
-                    f"or consider upgrading to a paid Google AI plan for higher limits. "
-                    f"Models attempted: {', '.join(models_tried[:3])}{'...' if len(models_tried) > 3 else ''}"
-                )
             elif not_found_errors > 0:
                 return (
-                    f"I'm sorry, but the AI models are not accessible. This might be due to "
+                    f"I'm sorry, but some AI models are not accessible. This might be due to "
                     f"API configuration issues or model availability changes. "
-                    f"Please contact the administrator. "
+                    f"The service is being updated to use only available models. "
                     f"Models attempted: {', '.join(models_tried[:3])}{'...' if len(models_tried) > 3 else ''}"
                 )
             else:
@@ -1038,6 +1068,12 @@ async def startup_event():
     discover_available_models()
     logger.info(f"Discovery completed. AVAILABLE_GOOGLE_AI_MODELS = {AVAILABLE_GOOGLE_AI_MODELS}")
     
+    # Check Groq fallback configuration
+    if groq_api_key:
+        logger.info("Groq API key configured - fallback service available")
+    else:
+        logger.warning("Groq API key not configured - no fallback service available")
+    
     logger.info("Loading sessions from files...")
     SESSIONS = load_sessions()
     logger.info(f"Loaded {len(SESSIONS)} sessions.")
@@ -1156,8 +1192,8 @@ Always answer the questions in the same language with the user quetsion. However
 Since you'are an assistant, always to encourage users to keep up and learn English. It would be better in a light and humurous way."""
 
         logger.info("Calling LLM for response generation...")
-        # Get response from LLM - using Google AI only
-        llm = GoogleAILLM()
+        # Get response from LLM - using multi-provider with Groq fallback
+        llm = MultiProviderLLM()
         answer = llm._call(prompt)
         logger.info(f"LLM response generated: {answer[:100]}...")
 
@@ -1309,8 +1345,8 @@ async def debug_model_test():
     """Test the first available model directly"""
     try:
         # Get available models using the same logic as the LLM
-        llm = GoogleAILLM()
-        available_models = llm._get_available_models()
+        google_llm = GoogleAILLM()
+        available_models = google_llm._get_available_models()
         
         if not available_models:
             return {
@@ -1321,22 +1357,22 @@ async def debug_model_test():
                 "quota_exceeded": list(quota_exceeded_models)
             }
         
-        # Test first available model
-        first_model = available_models[0]
+        # Test first available model with MultiProvider (includes Groq fallback)
+        multi_llm = MultiProviderLLM()
         try:
-            result = llm._call_with_model("Say hello", first_model)
+            result = multi_llm._call("Say hello")
             return {
                 "status": "success",
-                "model_tested": first_model,
                 "response": result,
-                "available_models": available_models
+                "available_google_models": available_models,
+                "groq_configured": bool(groq_api_key)
             }
         except Exception as e:
             return {
                 "status": "error",
                 "error": str(e),
-                "model_tested": first_model,
-                "available_models": available_models
+                "available_google_models": available_models,
+                "groq_configured": bool(groq_api_key)
             }
             
     except Exception as e:
