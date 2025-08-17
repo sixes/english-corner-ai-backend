@@ -62,14 +62,14 @@ import os
 is_mac = platform.system() == "Darwin"
 
 if is_mac:
-    print("Detected macOS - configuring SOCKS5 proxy for Google API access")
+    logger.info("Detected macOS - configuring SOCKS5 proxy for Google API access")
     # Set proxy environment variables for requests/httpx
     os.environ['HTTP_PROXY'] = 'socks5://127.0.0.1:51837'
     os.environ['HTTPS_PROXY'] = 'socks5://127.0.0.1:51837'
     os.environ['http_proxy'] = 'socks5://127.0.0.1:51837'
     os.environ['https_proxy'] = 'socks5://127.0.0.1:51837'
 else:
-    print("Detected non-macOS system - using direct connection")
+    logger.info("Detected non-macOS system - using direct connection")
 
 # Configure the new google-genai client
 client = genai.Client(api_key=api_key)
@@ -164,9 +164,9 @@ if not os.path.exists(SESSION_DATA_DIR):
         if os.path.exists(expanded_path):
             SESSION_DATA_DIR = expanded_path
             break
-    print(f"Using session data directory: {SESSION_DATA_DIR}")
+    logger.info(f"Using session data directory: {SESSION_DATA_DIR}")
 else:
-    print(f"Using VPS session data directory: {SESSION_DATA_DIR}")
+    logger.info(f"Using VPS session data directory: {SESSION_DATA_DIR}")
 
 # Combined documents = static known info + dynamic sessions
 DOCUMENTS = [
@@ -214,6 +214,9 @@ GOOGLE_AI_MODELS = [
     # Removed gemini-exp-1121 as it's causing 404 errors
 ]
 
+# This will be populated with actual available models at startup
+AVAILABLE_GOOGLE_AI_MODELS = []
+
 # Track which models have hit quota limits (reset on startup)
 quota_exceeded_models = set()  # For LLM models
 quota_exceeded_embedding_models = set()  # For embedding models (separate tracking)
@@ -231,7 +234,49 @@ def reset_quota_tracking():
     global quota_exceeded_models, quota_exceeded_embedding_models
     quota_exceeded_models.clear()
     quota_exceeded_embedding_models.clear()
-    print("Quota tracking reset - all models marked as available")
+    logger.info("Quota tracking reset - all models marked as available")
+
+def discover_available_models():
+    """Discover available Google AI models at startup"""
+    global AVAILABLE_GOOGLE_AI_MODELS
+    
+    try:
+        logger.info("Discovering available Google AI models...")
+        models_pager = client.models.list()
+        
+        discovered_models = []
+        for model in models_pager:
+            if hasattr(model, 'name'):
+                model_name = model.name
+                # Filter for text generation models (not embedding or vision-only models)
+                if any(keyword in model_name.lower() for keyword in ['gemini', 'text', 'chat']):
+                    discovered_models.append(model_name)
+                    logger.info(f"Discovered model: {model_name}")
+        
+        # Prioritize our preferred models, then add any others found
+        prioritized_models = []
+        
+        # First, add our preferred models that are actually available
+        for preferred_model in GOOGLE_AI_MODELS:
+            if preferred_model in discovered_models:
+                prioritized_models.append(preferred_model)
+        
+        # Then add any other discovered models we haven't listed
+        for discovered_model in discovered_models:
+            if discovered_model not in prioritized_models:
+                prioritized_models.append(discovered_model)
+        
+        AVAILABLE_GOOGLE_AI_MODELS = prioritized_models
+        logger.info(f"Available Google AI models: {AVAILABLE_GOOGLE_AI_MODELS}")
+        
+        if not AVAILABLE_GOOGLE_AI_MODELS:
+            logger.warning("No Google AI models discovered - using fallback list")
+            AVAILABLE_GOOGLE_AI_MODELS = GOOGLE_AI_MODELS
+            
+    except Exception as e:
+        logger.error(f"Failed to discover Google AI models: {e}")
+        logger.info("Using fallback model list")
+        AVAILABLE_GOOGLE_AI_MODELS = GOOGLE_AI_MODELS
 
 # Custom Google AI LLM for LangChain
 class GoogleAILLM(LLM):
@@ -244,88 +289,27 @@ class GoogleAILLM(LLM):
     def _get_available_models(self) -> List[str]:
         """Get list of available models that haven't exceeded quota"""
         if DEV_MODE:
-            return GOOGLE_AI_MODELS
+            return AVAILABLE_GOOGLE_AI_MODELS or GOOGLE_AI_MODELS
             
-        print(f"[DEBUG] Checking available models. quota_exceeded_models: {quota_exceeded_models}")
+        logger.debug(f"Checking available models. quota_exceeded_models: {quota_exceeded_models}")
         
-        try:
-            # Get actual available models from Google AI
-            print("[DEBUG] Calling client.models.list()...")
-            models_pager = client.models.list()
-            print(f"[DEBUG] Raw models response: {models_pager}")
-            
-            available_model_names = []
-            # Iterate through the pager to get actual models
-            try:
-                models_list = list(models_pager)  # Convert pager to list
-                print(f"[DEBUG] Models list length: {len(models_list)}")
-                
-                for model in models_list:
-                    print(f"[DEBUG] Processing model: {model}")
-                    if hasattr(model, 'name'):
-                        available_model_names.append(model.name)
-                        print(f"[DEBUG] Added model name: {model.name}")
-                    else:
-                        print(f"[DEBUG] Model has no 'name' attribute: {model}")
-                        
-            except Exception as pager_error:
-                print(f"[DEBUG] Error iterating pager: {pager_error}")
-                # Alternative: try to access the models directly
-                try:
-                    for model in models_pager:
-                        if hasattr(model, 'name'):
-                            available_model_names.append(model.name)
-                            print(f"[DEBUG] Added model name (alt method): {model.name}")
-                except Exception as iter_error:
-                    print(f"[DEBUG] Alternative iteration also failed: {iter_error}")
-            
-            print(f"[DEBUG] Google AI reports {len(available_model_names)} total models available")
-            print(f"[DEBUG] Available model names: {available_model_names}")
-            
-            # If no models found via API listing, use our predefined list
-            if not available_model_names:
-                print("[DEBUG] No models found via API listing, using predefined list")
-                available_model_names = GOOGLE_AI_MODELS  # Use our predefined models
-            
-            # Filter out models that have exceeded quota and match our preferred list
-            available_models = []
-            for model in GOOGLE_AI_MODELS:
-                if model in available_model_names and model not in quota_exceeded_models:
-                    available_models.append(model)
-                    print(f"[DEBUG] Model {model}: Available")
-                elif model not in available_model_names:
-                    # If API listing failed, assume model exists unless proven otherwise
-                    if not available_model_names or len(available_model_names) == len(GOOGLE_AI_MODELS):
-                        available_models.append(model)  
-                        print(f"[DEBUG] Model {model}: Assuming available (API listing incomplete)")
-                    else:
-                        print(f"[DEBUG] Model {model}: Not found in Google AI list")
-                elif model in quota_exceeded_models:
-                    print(f"[DEBUG] Model {model}: Quota exceeded")
-            
-            # If all preferred models are quota-exceeded, try other available models
-            if not available_models:
-                print("[DEBUG] No preferred models available, checking other Gemini models...")
-                for model_name in available_model_names:
-                    if model_name not in quota_exceeded_models and 'gemini' in model_name.lower():
-                        available_models.append(model_name)
-                        print(f"[DEBUG] Found alternative model: {model_name}")
-            
-            print(f"[DEBUG] Final available models: {available_models}")
-            return available_models
-            
-        except Exception as e:
-            print(f"[ERROR] Exception getting available models: {e}")
-            import traceback
-            print(f"[ERROR] Full traceback: {traceback.format_exc()}")
-            # Fallback to our predefined list when API listing fails
-            fallback_models = [model for model in GOOGLE_AI_MODELS if model not in quota_exceeded_models]
-            print(f"[DEBUG] API listing failed, using fallback models: {fallback_models}")
-            # If no fallback models available, at least try the most common one
-            if not fallback_models:
-                print("[DEBUG] No fallback models, trying gemini-1.5-flash as last resort")
-                fallback_models = ["gemini-1.5-flash"]
-            return fallback_models
+        # Use the models discovered at startup
+        available_models = [model for model in AVAILABLE_GOOGLE_AI_MODELS if model not in quota_exceeded_models]
+        
+        logger.debug(f"Available models after filtering: {available_models}")
+        
+        # If all discovered models are quota-exceeded, reset quota tracking (quotas may have reset)
+        if not available_models and AVAILABLE_GOOGLE_AI_MODELS:
+            logger.debug("All discovered models quota-exceeded, resetting quota tracking...")
+            quota_exceeded_models.clear()
+            available_models = AVAILABLE_GOOGLE_AI_MODELS
+        
+        # If still no models, fall back to our predefined list
+        if not available_models:
+            logger.debug("No models available from discovery, using fallback list")
+            available_models = [model for model in GOOGLE_AI_MODELS if model not in quota_exceeded_models]
+        
+        return available_models
 
     @property
     def _llm_type(self) -> str:
@@ -334,27 +318,31 @@ class GoogleAILLM(LLM):
     def _call_with_model(self, prompt: str, model_name: str) -> str:
         """Call Google AI with a specific model"""
         try:
-            print(f"Calling Google AI with model: {model_name}")
+            logger.debug(f"Calling Google AI with model: {model_name}")
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt
             )
-            print(f"Success with model {model_name}")
+            logger.debug(f"Success with model {model_name}")
             return response.text
             
         except Exception as e:
             error_str = str(e)
-            print(f"Error with model {model_name}: {error_str}")
+            logger.debug(f"Error with model {model_name}: {error_str}")
             
             # Check if it's a 404 or model not found error
-            if any(keyword in error_str.lower() for keyword in ["404", "not_found", "not found", "is not found"]):
-                print(f"Model {model_name} not found (404), marking as unavailable and trying next model")
+            if any(keyword in error_str.lower() for keyword in ["404", "not_found", "not found", "is not found", "model_not_found"]):
+                logger.warning(f"Model {model_name} not found (404), marking as unavailable and auto-switching to next model")
                 quota_exceeded_models.add(model_name)
+                # Remove from available models list to prevent future attempts
+                if model_name in AVAILABLE_GOOGLE_AI_MODELS:
+                    AVAILABLE_GOOGLE_AI_MODELS.remove(model_name)
+                    logger.warning(f"Removed {model_name} from available models due to 404 error")
                 raise Exception(f"MODEL_NOT_FOUND_{model_name}")
             
             # Check if it's a quota error
             elif any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "rate limit"]):
-                print(f"Quota exceeded for model {model_name}, marking as unavailable")
+                logger.warning(f"Quota exceeded for model {model_name}, marking as unavailable and auto-switching to next model")
                 quota_exceeded_models.add(model_name)
                 raise Exception(f"QUOTA_EXCEEDED_{model_name}")
             else:
@@ -371,18 +359,18 @@ class GoogleAILLM(LLM):
         if DEV_MODE:
             return f"Mock response for development mode. Query: {prompt[:100]}..."
 
-        print(f"[DEBUG] Starting LLM call. Current quota_exceeded_models: {quota_exceeded_models}")
+        logger.debug(f"Starting LLM call. Current quota_exceeded_models: {quota_exceeded_models}")
 
         # Get available models
         available_models = self._get_available_models()
-        print(f"[DEBUG] Available models after filtering: {available_models}")
+        logger.debug(f"Available models after filtering: {available_models}")
         
         if not available_models:
             # Reset quota tracking if all models are exhausted (maybe quotas have reset)
-            print("All models quota-exceeded, resetting quota tracking...")
+            logger.info("All models quota-exceeded, resetting quota tracking...")
             quota_exceeded_models.clear()
             available_models = self._get_available_models()
-            print(f"[DEBUG] Available models after reset: {available_models}")
+            logger.debug(f"Available models after reset: {available_models}")
         
         if not available_models:
             # Still no models available, return helpful error
@@ -394,32 +382,51 @@ class GoogleAILLM(LLM):
 
         # Try each available model in order
         last_error = None
+        models_tried = []
+        
         for model_name in available_models:
-            print(f"[DEBUG] Trying model: {model_name}")
+            logger.debug(f"Trying model: {model_name}")
+            models_tried.append(model_name)
+            
             try:
                 result = self._call_with_model(prompt, model_name)
-                print(f"[DEBUG] Model {model_name} succeeded!")
+                logger.debug(f"Model {model_name} succeeded! Auto-switching worked.")
                 return result
                 
             except Exception as e:
                 last_error = str(e)
-                print(f"[DEBUG] Model {model_name} failed: {last_error}")
+                logger.debug(f"Model {model_name} failed: {last_error}")
+                
                 if "QUOTA_EXCEEDED" in last_error:
-                    print(f"Model {model_name} quota exceeded, trying next model...")
+                    logger.info(f"Model {model_name} quota exceeded, auto-switching to next model...")
+                    continue
+                elif "MODEL_NOT_FOUND" in last_error:
+                    logger.info(f"Model {model_name} not found, auto-switching to next model...")
                     continue
                 else:
-                    print(f"Model {model_name} failed with non-quota error: {last_error}")
-                    # For non-quota errors, still try next model but with a delay
+                    logger.warning(f"Model {model_name} failed with error: {last_error}, trying next model...")
+                    # For other errors, still try next model but with a delay
                     import time
                     time.sleep(1)
                     continue
 
         # If we get here, all models failed
-        print(f"[DEBUG] All models failed. Last error: {last_error}")
-        return (
-            f"I'm sorry, but I'm currently experiencing technical difficulties with Google AI services. "
-            f"Please try again in a moment. Technical details: {last_error}"
-        )
+        logger.error(f"All models failed after trying: {models_tried}. Last error: {last_error}")
+        
+        # Provide more helpful error message based on the type of failures
+        if models_tried:
+            return (
+                f"I'm sorry, but I'm currently experiencing technical difficulties. "
+                f"I tried {len(models_tried)} different AI models but all failed. "
+                f"This might be due to temporary service issues or quota limits. "
+                f"Please try again in a few minutes. "
+                f"Models attempted: {', '.join(models_tried[:3])}{'...' if len(models_tried) > 3 else ''}"
+            )
+        else:
+            return (
+                f"I'm sorry, but no AI models are currently available. "
+                f"This might be due to service maintenance. Please try again later."
+            )
 
 # Groq LLM class for free fallback when Google AI is exhausted
 class GroqLLM(LLM):
@@ -506,18 +513,18 @@ class MultiProviderLLM(LLM):
                 return result
                 
         except Exception as e:
-            print(f"Google AI failed with exception: {e}")
+            logger.warning(f"Google AI failed with exception: {e}")
             google_exhausted = True
         
         # If Google AI is exhausted and we have Groq configured, try Groq
         if google_exhausted and self._groq_llm:
-            print("Google AI exhausted, trying Groq as fallback...")
+            logger.info("Google AI exhausted, trying Groq as fallback...")
             try:
                 result = self._groq_llm._call(prompt, stop, run_manager)
                 # Add a note that we're using fallback
                 return f"{result}\n\n*(Response generated using fallback AI service due to quota limits)*"
             except Exception as e:
-                print(f"Groq also failed: {e}")
+                logger.error(f"Groq also failed: {e}")
         
         # If both failed or Groq not configured, return Google AI result
         return result if 'result' in locals() else (
@@ -537,7 +544,7 @@ class GoogleAIEmbeddings(Embeddings):
         global quota_exceeded_embedding_models
         
         if DEV_MODE:
-            print(f"DEV_MODE: Creating mock embedding for text: {text[:50]}...")
+            logger.debug(f"DEV_MODE: Creating mock embedding for text: {text[:50]}...")
             import hashlib
             import numpy as np
             text_hash = hashlib.md5(text.encode()).hexdigest()
@@ -555,7 +562,7 @@ class GoogleAIEmbeddings(Embeddings):
 
         for model_name in available_models:
             try:
-                print(f"Getting embedding with model: {model_name}")
+                logger.debug(f"Getting embedding with model: {model_name}")
                 
                 import signal
                 def timeout_handler(signum, frame):
@@ -587,7 +594,7 @@ class GoogleAIEmbeddings(Embeddings):
                     elif hasattr(response, 'values'):
                         embedding_data = response.values
                     else:
-                        print(f"Unknown response format for {model_name}")
+                        logger.warning(f"Unknown response format for {model_name}")
                         continue
 
                     if hasattr(embedding_data, 'values'):
@@ -596,7 +603,7 @@ class GoogleAIEmbeddings(Embeddings):
                     if isinstance(embedding_data, (list, tuple)):
                         embedding_list = [float(x) for x in embedding_data]
                         if embedding_list and len(embedding_list) > 0:
-                            print(f"Embedding successful with {model_name}, got {len(embedding_list)} dimensions")
+                            logger.debug(f"Embedding successful with {model_name}, got {len(embedding_list)} dimensions")
                             return embedding_list
 
                 finally:
@@ -605,14 +612,14 @@ class GoogleAIEmbeddings(Embeddings):
             except Exception as e:
                 error_str = str(e)
                 if any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted"]):
-                    print(f"Embedding quota exceeded for {model_name}")
+                    logger.warning(f"Embedding quota exceeded for {model_name}")
                     quota_exceeded_embedding_models.add(model_name)
                     continue
                 else:
-                    print(f"Embedding error with {model_name}: {e}")
+                    logger.warning(f"Embedding error with {model_name}: {e}")
                     continue
 
-        print("All embedding models failed or quota exceeded")
+        logger.warning("All embedding models failed or quota exceeded")
         return None
 
     def _get_embedding(self, text: str) -> Optional[List[float]]:
@@ -762,7 +769,7 @@ def get_embedding(text, model="text-embedding-004"):
         )
         return response.values
     except Exception as e:
-        print(f"Embedding error: {e}")
+        logger.error(f"Embedding error: {e}")
         return None
 
 def cosine_similarity(vec1, vec2):
@@ -815,25 +822,25 @@ def setup_vector_store_and_chain():
     """Initialize simple in-memory vector store"""
     global vector_store, conversation_chain
 
-    print("Creating embeddings instance...")
+    logger.info("Creating embeddings instance...")
     # Create embeddings
     embeddings = GoogleAIEmbeddings()
 
-    print("Creating documents from data...")
+    logger.info("Creating documents from data...")
     # Create documents
     documents = create_documents_from_data()
 
     if not documents:
         raise ValueError("No documents available to create vector store")
 
-    print(f"Created {len(documents)} documents, building vector store...")
+    logger.info(f"Created {len(documents)} documents, building vector store...")
     # Create vector store using simple in-memory implementation
     vector_store = SimpleVectorStore.from_documents(
         documents=documents,
         embedding=embeddings
     )
 
-    print("Vector store setup completed!")
+    logger.info("Vector store setup completed!")
     # Note: We're not using the complex ConversationalRetrievalChain anymore
     # to avoid recursion issues. We'll handle conversation logic directly.
 
@@ -910,7 +917,7 @@ def load_sessions():
                 if session["id"] is not None:
                     sessions.append(session)
         except Exception as e:
-            print(f"Failed to load session from {fpath}: {e}")
+            logger.error(f"Failed to load session from {fpath}: {e}")
     return sessions
 
 # Legacy functions removed - now using LangChain vector store
@@ -959,12 +966,16 @@ def get_top_attendee():
 async def startup_event():
     global SESSIONS
     logger.info("Starting up RAG Backend...")
+    
+    logger.info("Resetting quota tracking...")
+    reset_quota_tracking()
+    
+    logger.info("Discovering available Google AI models...")
+    discover_available_models()
+    
     logger.info("Loading sessions from files...")
     SESSIONS = load_sessions()
     logger.info(f"Loaded {len(SESSIONS)} sessions.")
-
-    logger.info("Resetting quota tracking...")
-    reset_quota_tracking()
 
     logger.info("Setting up vector store...")
     setup_vector_store_and_chain()
@@ -1154,7 +1165,7 @@ async def test_google_ai():
     # Try each available model
     for model_name in available_models:
         try:
-            print(f"[TEST] Testing model: {model_name}")
+            logger.debug(f"Testing model: {model_name}")
             test_prompt = "Hello, please respond with 'API test successful'"
             
             response = client.models.generate_content(
@@ -1171,17 +1182,17 @@ async def test_google_ai():
             
         except Exception as e:
             error_str = str(e)
-            print(f"[TEST ERROR] Model {model_name} failed: {error_str}")
+            logger.warning(f"Model {model_name} failed: {error_str}")
             
             # Check if it's a 404 or model not found error
             if any(keyword in error_str.lower() for keyword in ["404", "not_found", "not found", "is not found"]):
-                print(f"Model {model_name} not found (404), marking as unavailable")
+                logger.warning(f"Model {model_name} not found (404), marking as unavailable")
                 quota_exceeded_models.add(model_name)
                 continue  # Try next model
             
             # Check if it's a quota error
             elif any(keyword in error_str.lower() for keyword in ["429", "quota", "resource_exhausted", "rate limit"]):
-                print(f"Quota exceeded for model {model_name}, marking as unavailable")
+                logger.warning(f"Quota exceeded for model {model_name}, marking as unavailable")
                 quota_exceeded_models.add(model_name)
                 continue  # Try next model
             else:
@@ -1207,10 +1218,12 @@ async def test_google_ai():
 async def debug_ai_status():
     """Debug endpoint to check AI provider status"""
     google_status = {
-        "available_models": [m for m in GOOGLE_AI_MODELS if m not in quota_exceeded_models],
+        "discovered_models": AVAILABLE_GOOGLE_AI_MODELS,
+        "fallback_models": GOOGLE_AI_MODELS,
+        "available_models": [m for m in AVAILABLE_GOOGLE_AI_MODELS if m not in quota_exceeded_models],
         "quota_exceeded_llm_models": list(quota_exceeded_models),
         "quota_exceeded_embedding_models": list(quota_exceeded_embedding_models),
-        "total_google_models": len(GOOGLE_AI_MODELS)
+        "total_discovered_models": len(AVAILABLE_GOOGLE_AI_MODELS)
     }
     
     groq_status = {
